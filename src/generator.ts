@@ -1,8 +1,11 @@
 import template from 'mustache';
+import username from 'username';
 import chalk from 'chalk';
 import shell from 'shelljs';
+import uuid from 'uuid';
 import path from 'path';
 import fs from 'fs-extra';
+import os from 'os';
 
 interface Dictionary {
   [name: string]: any;
@@ -18,12 +21,8 @@ export interface GeneratorOptions {
 }
 
 const COMMON_FOLDER = 'common';
-const PATH_PATTERNS: Dictionary = {
-  '_eslintrc': '.eslintrc',
-  '_gitignore': '.gitignore',
-  '_tsconfig.json': 'tsconfig.json',
-  '_tslint.json': 'tslint.json',
-};
+const KEYS_FOLDER = 'keys';
+const WINDOWS_FOLDER = 'windows';
 
 export class Generator {
   private projectPatterns: Dictionary = {};
@@ -57,13 +56,37 @@ export class Generator {
 
   private generateApp(): void {
     const { templatePath, sourceType } = this.options;
+    const certificateThumbprint = this.buildWindowsCertificate();
     const ignorePaths = ['_package.json'];
 
-    [COMMON_FOLDER, sourceType]
+    const contnetPatterns = {
+      ...this.projectPatterns,
+      ...certificateThumbprint && { certificateThumbprint },
+      currentUser: username.sync(),
+      packageGuid: uuid.v4(),
+      projectGuid: uuid.v4(),
+    };
+
+    const pathPatterns = {
+      ...this.projectPatterns,
+      '_eslintrc': '.eslintrc',
+      '_gitignore': '.gitignore',
+      '_tsconfig.json': 'tsconfig.json',
+      '_tslint.json': 'tslint.json',
+    };
+
+    const srcFolders = [COMMON_FOLDER, sourceType];
+    if (!certificateThumbprint) {
+      console.log(chalk.bold.yellow('[windows] Using Default Certificate. Use Visual Studio to renew it.'));
+      srcFolders.push(KEYS_FOLDER);
+    }
+
+    srcFolders
       .map(folderName => path.join(templatePath, folderName))
       .forEach(srcPath => (
-        this.walk(srcPath, ignorePaths)
-          .forEach((absolutePath: string) => this.copy(absolutePath, this.buildDestPath(srcPath, absolutePath)))
+        this.walk(srcPath, ignorePaths).forEach((absolutePath: string) => {
+          this.copy(absolutePath, this.buildDestPath(srcPath, absolutePath, pathPatterns), contnetPatterns);
+        })
       ));
   }
 
@@ -167,8 +190,7 @@ export class Generator {
     this.packageJson = JSON.parse(packageJson as any);
   }
 
-  private buildDestPath(srcPath: string, absolutePath: string): string {
-    const patterns = { ...this.projectPatterns, ...PATH_PATTERNS };
+  private buildDestPath(srcPath: string, absolutePath: string, patterns: Dictionary): string {
     let destPath = path.resolve(this.options.projectPath, path.relative(srcPath, absolutePath));
 
     Object
@@ -178,7 +200,7 @@ export class Generator {
     return destPath;
   }
 
-  private copy(srcPath: string, destPath: string): void {
+  private copy(srcPath: string, destPath: string, patterns: Dictionary): void {
     if (fs.lstatSync(srcPath).isDirectory()) {
       if (!fs.existsSync(destPath)) {
         fs.mkdirSync(destPath);
@@ -191,7 +213,7 @@ export class Generator {
       if (this.isBinary(srcPath)) {
         fs.copyFileSync(srcPath, destPath);
       } else {
-        const content = template.render(fs.readFileSync(srcPath, 'utf8'), this.projectPatterns);
+        const content = template.render(fs.readFileSync(srcPath, 'utf8'), patterns);
         fs.writeFileSync(destPath, content, { encoding: 'utf8', mode: permissions });
       }
     }
@@ -212,6 +234,39 @@ export class Generator {
       .concat
       .apply([srcPath], fs.readdirSync(srcPath).map(child => this.walk(path.join(srcPath, child))))
       .filter((absolutePath: string) => !isIgnored(absolutePath));
+  }
+
+  private buildWindowsCertificate(): string {
+    const { projectPath, projectName } = this.options;
+
+    if (os.platform() !== 'win32') {
+      return '';
+    }
+
+    console.log(chalk.white.bold('[windows] Generating self-signed certificate...'));
+    const certificatesDestPath = path.join(projectPath, WINDOWS_FOLDER, projectName);
+    const certGenCommandArgs = [
+      `$cert = New-SelfSignedCertificate -KeyUsage DigitalSignature -KeyExportPolicy Exportable -Subject "CN=${ username.sync() }" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}Subject Type:End Entity") -CertStoreLocation "Cert:\\CurrentUser\\My"`,
+      '$pwd = ConvertTo-SecureString -String password -Force -AsPlainText',
+      `New-Item -ErrorAction Ignore -ItemType directory -Path ${ path.join(projectPath, 'windows', projectName) }`,
+      `Export-PfxCertificate -Cert "cert:\\CurrentUser\\My\\$($cert.Thumbprint)" -FilePath ${ path.join(projectPath, 'windows', projectName, projectName) }_TemporaryKey.pfx -Password $pwd`,
+      '$cert.Thumbprint',
+    ].join(';');
+
+    if (!fs.existsSync(certificatesDestPath)) {
+      fs.mkdirpSync(certificatesDestPath);
+    }
+
+    const { code, stdout } = shell.exec(['powershell', '-command', certGenCommandArgs].join(' '));
+    if (code === 0) {
+      console.log(chalk.green.bold('[windows] Self-signed certificate generated successfully.'));
+
+      const output = stdout.toString().trim().split('\n');
+      return output[output.length - 1];
+    }
+
+    console.log(chalk.bold.yellow('[windows] Failed to generate Self-signed certificate'));
+    return '';
   }
 
 }
